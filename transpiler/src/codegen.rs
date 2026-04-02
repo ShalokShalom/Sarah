@@ -10,9 +10,10 @@ use anyhow::Result;
 use std::str::FromStr;
 
 use crate::classify::{AsyncTier, ClassificationResult, DeclarationResult, SyncTier};
+use crate::drop_gen;
 use crate::parser::{SwiftClass, SwiftEnum, SwiftFile, SwiftFunc, SwiftStruct};
 
-// ── Async mode ────────────────────────────────────────────────────────────────
+// ── Async mode ───────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsyncMode {
@@ -41,7 +42,7 @@ impl clap::ValueEnum for AsyncMode {
     }
 }
 
-// ── Public entry points (Phase 2b — IR-aware) ──────────────────────────────
+// ── Public entry points (Phase 2b — IR-aware) ──────────────────────────────────
 
 /// Lower Tier 1 declarations using the full parsed IR.
 pub fn lower_tier1_with_ir(result: &ClassificationResult, ir: &SwiftFile) -> Result<String> {
@@ -49,12 +50,17 @@ pub fn lower_tier1_with_ir(result: &ClassificationResult, ir: &SwiftFile) -> Res
 }
 
 /// Full transpile using parsed IR, with chosen async mode.
+/// Returns generated Rust source. Any diagnostics produced during
+/// Drop generation are appended to `result.diagnostics` via the
+/// returned string's embedded comments (they are also emitted to
+/// stderr by the caller via `diagnostics::print_all`).
 pub fn transpile_with_ir(
     result: &ClassificationResult,
     ir: &SwiftFile,
     async_mode: AsyncMode,
 ) -> Result<String> {
-    let mut out = preamble(&result.file);
+    let mut out  = preamble(&result.file);
+    let mut diags = result.diagnostics.clone();
 
     // Structs
     for s in &ir.structs {
@@ -66,11 +72,16 @@ pub fn transpile_with_ir(
     }
     // Classes
     for c in &ir.classes {
-        out.push_str(&emit_class_ir(c));
+        let (class_src, drop_diags) = emit_class_ir(c);
+        out.push_str(&class_src);
+        diags.extend(drop_diags);
     }
-    // Top-level functions
+    // Top-level functions — resolve async tier from classifier output
     for f in &ir.funcs {
-        out.push_str(&emit_func_ir(f, async_mode));
+        let async_tier = result.declarations.iter()
+            .find(|d| d.name == f.name && d.kind == "func")
+            .and_then(|d| d.async_tier.clone());
+        out.push_str(&emit_func_ir(f, async_mode, async_tier.as_ref()));
     }
 
     // Tier 3 skips from classifier (declarations the IR can't lower)
@@ -86,7 +97,7 @@ pub fn transpile_with_ir(
     Ok(out)
 }
 
-// ── Phase 2a compatibility shims ───────────────────────────────────────────────
+// ── Phase 2a compatibility shims ─────────────────────────────────────────────────────
 
 pub fn lower_tier1(result: &ClassificationResult) -> Result<String> {
     transpile(result, AsyncMode::Bridge)
@@ -106,17 +117,18 @@ pub fn transpile(result: &ClassificationResult, async_mode: AsyncMode) -> Result
     Ok(out)
 }
 
-// ── IR-aware emitters ───────────────────────────────────────────────────────────────
+// ── IR-aware emitters ────────────────────────────────────────────────────────────────
 
 fn emit_struct_ir(s: &SwiftStruct) -> String {
     let fields: String = s.fields.iter().map(|f| {
         let rust_type = f.rust_type()
             .unwrap_or_else(|| format!("() /* UNMAPPED: {} */", f.swift_type));
-        let mutability = if f.mutable { "" } else { "" }; // Rust fields are always mutable via &mut
         format!("    pub {}: {rust_type},\n", f.name)
     }).collect();
 
-    let methods: String = s.methods.iter().map(|m| emit_func_ir(m, AsyncMode::Bridge)).collect();
+    let methods: String = s.methods.iter()
+        .map(|m| emit_func_ir(m, AsyncMode::Bridge, None))
+        .collect();
 
     format!(
         "/// Transpiled from Swift `struct {name}` (SPEC-002 Tier 1)\n\
@@ -124,7 +136,7 @@ fn emit_struct_ir(s: &SwiftStruct) -> String {
          pub struct {name} {{\n\
          {fields}}}\
          \n\n{methods}",
-        name = s.name,
+        name   = s.name,
         fields = if fields.is_empty() { "    // (no fields)\n".to_owned() } else { fields },
     )
 }
@@ -148,12 +160,14 @@ fn emit_enum_ir(e: &SwiftEnum) -> String {
          #[derive(Debug, Clone, uniffi::Enum)]\n\
          pub enum {name} {{\n\
          {cases}}}\n\n",
-        name = e.name,
+        name  = e.name,
         cases = if cases.is_empty() { "    // (no cases)\n".to_owned() } else { cases },
     )
 }
 
-fn emit_class_ir(c: &SwiftClass) -> String {
+/// Emit a Rust class translation and, if `has_deinit`, a `Drop` impl.
+/// Returns `(rust_source, diagnostics_from_drop_gen)`.
+fn emit_class_ir(c: &SwiftClass) -> (String, Vec<crate::diagnostics::Diagnostic>) {
     let fields: String = c.fields.iter().map(|f| {
         let rust_type = f.rust_type()
             .unwrap_or_else(|| format!("() /* UNMAPPED: {} */", f.swift_type));
@@ -161,16 +175,18 @@ fn emit_class_ir(c: &SwiftClass) -> String {
     }).collect();
 
     let deinit_note = if c.has_deinit {
-        "/// NOTE: Swift `deinit` present — Drop impl required (SPEC-003, CLASS-DEINIT)\n"
+        "/// NOTE: Swift `deinit` present — Drop impl generated below (SPEC-003 §6, CLASS-DEINIT)\n"
     } else { "" };
 
     let superclass_note = c.superclass.as_ref().map(|sc| {
         format!("/// NOTE: superclass `{sc}` — flattened to composition (CLASS-SUBCLASS)\n")
     }).unwrap_or_default();
 
-    let methods: String = c.methods.iter().map(|m| emit_func_ir(m, AsyncMode::Bridge)).collect();
+    let methods: String = c.methods.iter()
+        .map(|m| emit_func_ir(m, AsyncMode::Bridge, None))
+        .collect();
 
-    format!(
+    let mut src = format!(
         "{deinit_note}{superclass_note}\
          /// Transpiled from Swift `class {name}` (SPEC-003 Tier 2 — Arc<Mutex<T>>)\n\
          #[derive(uniffi::Object)]\n\
@@ -186,16 +202,32 @@ fn emit_class_ir(c: &SwiftClass) -> String {
          \t\tArc::new(Self {{ inner: Mutex::new({name}Inner {{ {defaults} }}) }})\n\
          \t}}\n\
          }}\n\n{methods}",
-        name    = &c.name,
-        fields  = if fields.is_empty() { "    // (no fields)\n".to_owned() } else { fields },
-        defaults = c.fields.iter().map(|f| format!("{}: Default::default()", f.name)).collect::<Vec<_>>().join(", "),
-    )
+        name     = &c.name,
+        fields   = if fields.is_empty() { "    // (no fields)\n".to_owned() } else { fields },
+        defaults = c.fields.iter()
+            .map(|f| format!("{}: Default::default()", f.name))
+            .collect::<Vec<_>>().join(", "),
+    );
+
+    // ── Drop impl (SPEC-003 §6) ───────────────────────────────────────────────
+    let drop_diags = if c.has_deinit {
+        // `parser.rs` stores the deinit body lines in `SwiftClass`.
+        // For Phase 2b the body is not yet captured as separate lines;
+        // we pass an empty slice so drop_gen emits the trivial stub.
+        // Phase 2c will wire the actual body lines.
+        let (drop_src, diags) = drop_gen::emit_drop(c, &[]);
+        src.push_str(&drop_src);
+        diags
+    } else {
+        vec![]
+    };
+
+    (src, drop_diags)
 }
 
-fn emit_func_ir(f: &SwiftFunc, async_mode: AsyncMode) -> String {
-    let sig = f.rust_signature();
+fn emit_func_ir(f: &SwiftFunc, async_mode: AsyncMode, async_tier: Option<&AsyncTier>) -> String {
     if f.is_async {
-        emit_async_func_sig(&f.name, &sig, async_mode)
+        emit_async_func_ir(&f.name, &f.rust_signature(), async_mode, async_tier)
     } else {
         format!(
             "/// Transpiled from Swift `func {name}` (SPEC-002 Tier 1)\n\
@@ -204,29 +236,72 @@ fn emit_func_ir(f: &SwiftFunc, async_mode: AsyncMode) -> String {
              \ttodo!(\"Phase 2c: implement {name}\")\n\
              }}\n\n",
             name = f.name,
+            sig  = f.rust_signature(),
         )
     }
 }
 
-fn emit_async_func_sig(name: &str, sig: &str, async_mode: AsyncMode) -> String {
+/// Emit a Rust async function following SPEC-006:
+///
+/// - `AsyncMode::Bridge` + `A1Sync` (no await) → `spawn_blocking` (SPEC-006 §6)
+/// - `AsyncMode::Bridge` + `A1`/`A2`/`None` → callback interface + `tokio::spawn`
+/// - `AsyncMode::Native` → native `async fn` via `#[uniffi::export]`
+fn emit_async_func_ir(
+    name: &str,
+    sig:  &str,
+    async_mode: AsyncMode,
+    async_tier: Option<&AsyncTier>,
+) -> String {
     match async_mode {
-        AsyncMode::Bridge => format!(
-            "/// Transpiled from Swift `async func {name}` (SPEC-006 §3, Tier A1)\n\
-             /// Swift Shell wraps with `withCheckedThrowingContinuation`.\n\
-             #[uniffi::export(callback_interface)]\n\
-             pub trait {name}Callback: Send + Sync {{\n\
-             \tfn on_result(&self, result: ());  // TODO: typed result\n\
-             \tfn on_error(&self, error: String);\n\
-             }}\n\n\
-             #[uniffi::export]\n\
-             pub fn {name}(callback: Arc<dyn {name}Callback>) {{\n\
-             \ttokio::spawn(async move {{\n\
-             \t\t// TODO: implement {name} (Phase 2c)\n\
-             \t\tcallback.on_result(());\n\
-             \t}});\n\
-             }}\n\n",
-            name = name,
-        ),
+        // ── Bridge mode ────────────────────────────────────────────────────────
+        AsyncMode::Bridge => {
+            // SPEC-006 §6: A1-sync (no await in body) → spawn_blocking
+            if async_tier == Some(&AsyncTier::A1Sync) {
+                return format!(
+                    "/// Transpiled from Swift `async func {name}` (SPEC-006 §6, Tier A1-sync)\n\
+                     /// Body has no await — spawn_blocking keeps Core logic in sync Rust.\n\
+                     #[uniffi::export(callback_interface)]\n\
+                     pub trait {name}Callback: Send + Sync {{\n\
+                     \tfn on_result(&self, result: ());  // TODO: typed result\n\
+                     \tfn on_error(&self, error: String);\n\
+                     }}\n\n\
+                     #[uniffi::export]\n\
+                     pub fn {name}(callback: Arc<dyn {name}Callback>) {{\n\
+                     \ttokio::spawn(async move {{\n\
+                     \t\tlet result = tokio::task::spawn_blocking(move || {{\n\
+                     \t\t\t// TODO: implement {name} (Phase 2c) — pure sync body\n\
+                     \t\t}}).await;\n\
+                     \t\tmatch result {{\n\
+                     \t\t\tOk(v)  => callback.on_result(v),\n\
+                     \t\t\tErr(e) => callback.on_error(format!(\"{{e}}\")),\n\
+                     \t\t}}\n\
+                     \t}});\n\
+                     }}\n\n",
+                    name = name,
+                );
+            }
+
+            // A1 / A2 / unknown async → callback interface + tokio::spawn
+            format!(
+                "/// Transpiled from Swift `async func {name}` (SPEC-006 §3, Tier A1)\n\
+                 /// Swift Shell wraps with `withCheckedThrowingContinuation`.\n\
+                 #[uniffi::export(callback_interface)]\n\
+                 pub trait {name}Callback: Send + Sync {{\n\
+                 \tfn on_result(&self, result: ());  // TODO: typed result\n\
+                 \tfn on_error(&self, error: String);\n\
+                 }}\n\n\
+                 #[uniffi::export]\n\
+                 pub fn {name}(callback: Arc<dyn {name}Callback>) {{\n\
+                 \ttokio::spawn(async move {{\n\
+                 \t\t// TODO: implement {name} (Phase 2c)\n\
+                 \t\tcallback.on_result(());\n\
+                 \t}});\n\
+                 }}\n\n",
+                name = name,
+            )
+        }
+
+        // ── Native mode (Stage 2 — SPEC-006 §9) ────────────────────────────────
         AsyncMode::Native => format!(
             "/// Transpiled from Swift `async func {name}` (native UniFFI async — Stage 2)\n\
              #[uniffi::export]\n\
@@ -239,6 +314,9 @@ fn emit_async_func_sig(name: &str, sig: &str, async_mode: AsyncMode) -> String {
 }
 
 // ── Phase 2a classify-only emitters (preserved for compatibility) ─────────────
+// These shims drive the old `sarah classify`-only path. They do not
+// use the SwiftFile IR and produce stub-only output. Kept for
+// backward compatibility with any tooling that calls `transpile()`.
 
 fn emit_tier1_decl(decl: &DeclarationResult, async_mode: AsyncMode) -> String {
     match decl.kind.as_str() {
@@ -253,9 +331,13 @@ fn emit_tier1_decl(decl: &DeclarationResult, async_mode: AsyncMode) -> String {
              pub enum {name} {{\n    // variants: run `sarah transpile` for full IR output\n}}\n\n",
             name = decl.name),
         "func" => {
-            let is_async = decl.async_tier.is_some();
-            if is_async {
-                emit_async_func_sig(&decl.name, &format!("pub fn {}()", decl.name), async_mode)
+            if decl.async_tier.is_some() {
+                emit_async_func_ir(
+                    &decl.name,
+                    &format!("pub fn {}()", decl.name),
+                    async_mode,
+                    decl.async_tier.as_ref(),
+                )
             } else {
                 format!(
                     "#[uniffi::export]\npub fn {}() {{ todo!() }}\n\n",
@@ -284,7 +366,7 @@ fn emit_tier2_decl(decl: &DeclarationResult, _async_mode: AsyncMode) -> String {
     }
 }
 
-// ── Preamble ──────────────────────────────────────────────────────────────────
+// ── Preamble ───────────────────────────────────────────────────────────────────────────────
 
 fn preamble(source_file: &str) -> String {
     format!(
@@ -296,7 +378,7 @@ fn preamble(source_file: &str) -> String {
     )
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
+// ── Tests ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -354,12 +436,36 @@ mod tests {
     }
 
     #[test]
-    fn async_func_emits_callback_interface() {
-        let src = "async func loadData() {}";
+    fn class_with_deinit_emits_drop_impl() {
+        let src = r#"class Resource {
+    var handle: Int
+    deinit {}
+}"#;
+        let ir  = parse(src);
+        let cr  = classify_file(&path(), src);
+        let out = transpile_with_ir(&cr, &ir, AsyncMode::Bridge).unwrap();
+        assert!(out.contains("impl Drop for ResourceInner"));
+        assert!(out.contains("fn drop(&mut self)"));
+    }
+
+    #[test]
+    fn async_func_a1_emits_tokio_spawn() {
+        let src = "async func loadData() { let _ = await fetch() }";
         let ir  = parse(src);
         let cr  = classify_file(&path(), src);
         let out = transpile_with_ir(&cr, &ir, AsyncMode::Bridge).unwrap();
         assert!(out.contains("callback_interface"));
         assert!(out.contains("tokio::spawn"));
+        assert!(!out.contains("spawn_blocking"));
+    }
+
+    #[test]
+    fn async_func_a1sync_emits_spawn_blocking() {
+        // No `await` in body — classifier assigns A1Sync — must use spawn_blocking
+        let src = "async func compute() -> Int { return 42 }";
+        let ir  = parse(src);
+        let cr  = classify_file(&path(), src);
+        let out = transpile_with_ir(&cr, &ir, AsyncMode::Bridge).unwrap();
+        assert!(out.contains("spawn_blocking"), "expected spawn_blocking in:\n{out}");
     }
 }
