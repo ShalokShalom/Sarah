@@ -6,5 +6,7 @@
 pub mod classify;
 pub mod codegen;
 pub mod diagnostics;
+pub mod drop_gen;
 pub mod parser;
+pub mod shell_gen;
 pub mod types;

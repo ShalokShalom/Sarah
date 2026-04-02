@@ -1,18 +1,20 @@
 //! sarah-cli — entry point
 //!
-//! Dispatches subcommands to the transpiler pipeline stages.
-//!
+//! Subcommands:
 //! ```text
-//! sarah classify  <file.swift>   -- run SPEC-001 classifier, emit tier JSON
-//! sarah lower     <file.swift>   -- run SPEC-002 Tier 1 lowering, emit Rust source
-//! sarah transpile <file.swift>   -- full pipeline: classify → lower → emit
-//! sarah parse     <file.swift>   -- run the AST parser, emit SwiftFile IR JSON
+//! sarah classify   <file.swift>   -- SPEC-001 classifier, emit tier JSON
+//! sarah parse      <file.swift>   -- AST parser, emit SwiftFile IR JSON
+//! sarah lower      <file.swift>   -- SPEC-002 Tier 1 lowering, emit Rust
+//! sarah transpile  <file.swift>   -- full pipeline: classify → lower → emit Rust
+//! sarah shell      <file.swift>   -- emit Swift Shell source (Phase 2c)
 //! ```
 
 mod classify;
 mod codegen;
 mod diagnostics;
+mod drop_gen;
 mod parser;
+mod shell_gen;
 mod types;
 
 use anyhow::Result;
@@ -21,48 +23,39 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "sarah",
-    about = "Swift-to-Rust transpiler",
-    version = "0.1.0"
+    name     = "sarah",
+    about    = "Swift-to-Rust transpiler",
+    version  = "0.2.0"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Diagnostic output format
     #[arg(long, default_value = "terminal", global = true)]
     diagnostics: diagnostics::OutputMode,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Classify a Swift source file and emit tier JSON (SPEC-001)
-    Classify {
-        file: PathBuf,
-    },
-    /// Parse a Swift source file and emit SwiftFile IR JSON (Phase 2b)
-    Parse {
-        file: PathBuf,
-    },
-    /// Lower a Swift source file to Tier 1 Rust (SPEC-002)
-    Lower {
-        file: PathBuf,
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
-    /// Full pipeline: classify → parse → lower → emit Rust + UniFFI annotations
+    Classify  { file: PathBuf },
+    Parse     { file: PathBuf },
+    Lower     { file: PathBuf, #[arg(short, long)] output: Option<PathBuf> },
     Transpile {
-        file: PathBuf,
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-        /// Async bridging mode
-        #[arg(long, default_value = "bridge")]
-        async_mode: codegen::AsyncMode,
+        file:   PathBuf,
+        #[arg(short, long)] output: Option<PathBuf>,
+        #[arg(long, default_value = "bridge")] async_mode: codegen::AsyncMode,
+    },
+    /// Emit Swift Shell source from a Swift input file (Phase 2c).
+    Shell {
+        file:   PathBuf,
+        #[arg(short, long)] output: Option<PathBuf>,
+        /// UniFFI module name to import in the generated Shell
+        #[arg(long, default_value = "CoreFFI")] ffi_module: String,
     },
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli      = Cli::parse();
     let diag_mode = cli.diagnostics;
 
     match cli.command {
@@ -80,23 +73,30 @@ fn main() -> Result<()> {
         }
         Commands::Lower { file, output } => {
             let source = std::fs::read_to_string(&file)?;
-            let class_result = classify::classify_file(&file, &source);
-            diagnostics::print_all(&class_result.diagnostics, diag_mode);
-            let ir = parser::parse(&source);
-            let rust_source = codegen::lower_tier1_with_ir(&class_result, &ir)?;
-            emit_output(output, &rust_source)?;
-            std::process::exit(class_result.exit_code());
+            let cr  = classify::classify_file(&file, &source);
+            diagnostics::print_all(&cr.diagnostics, diag_mode);
+            let ir  = parser::parse(&source);
+            let out = codegen::lower_tier1_with_ir(&cr, &ir)?;
+            emit_output(output, &out)?;
+            std::process::exit(cr.exit_code());
         }
         Commands::Transpile { file, output, async_mode } => {
             let source = std::fs::read_to_string(&file)?;
-            let class_result = classify::classify_file(&file, &source);
-            diagnostics::print_all(&class_result.diagnostics, diag_mode);
-            let ir = parser::parse(&source);
-            let rust_source = codegen::transpile_with_ir(&class_result, &ir, async_mode)?;
-            emit_output(output, &rust_source)?;
-            std::process::exit(class_result.exit_code());
+            let cr  = classify::classify_file(&file, &source);
+            diagnostics::print_all(&cr.diagnostics, diag_mode);
+            let ir  = parser::parse(&source);
+            let out = codegen::transpile_with_ir(&cr, &ir, async_mode)?;
+            emit_output(output, &out)?;
+            std::process::exit(cr.exit_code());
+        }
+        Commands::Shell { file, output, ffi_module } => {
+            let source = std::fs::read_to_string(&file)?;
+            let ir  = parser::parse(&source);
+            let out = shell_gen::emit_shell(&ir, &ffi_module);
+            emit_output(output, &out)?;
         }
     }
+    Ok(())
 }
 
 fn emit_output(path: Option<PathBuf>, content: &str) -> Result<()> {
