@@ -148,6 +148,40 @@ pub fn parse_with_backend(source: &str, backend: ParserBackend) -> SwiftFile {
 }
 ```
 
+### 5.1 Why a flag rather than auto-detection
+
+> **This rationale is normative.** Do not remove the `--parser` flag in a
+> cleanup PR. The reasoning below is the reason it must remain explicit.
+
+Auto-detection — e.g., silently falling back to regex when tree-sitter
+fails — would hide parser regressions. The `--parser` flag exists for one
+precise reason: **contributors must be able to reproduce a regression
+against the regex baseline without modifying source code.**
+
+When a bug appears in tree-sitter output that does not appear in regex
+output (or vice versa), the investigator needs to run:
+
+```
+sarah transpile bad_input.swift --parser regex      > regex_out.swift
+sarah transpile bad_input.swift --parser treesitter > ts_out.swift
+diff regex_out.swift ts_out.swift
+```
+
+If the backend were auto-detected or selected only at build time, this
+diff workflow would require either patching source or maintaining a
+separate build variant — both of which are fragile and easy to break
+silently in a "cleanup" commit.
+
+A second consequence: the round-trip test suite in
+`transpiler/tests/round_trip.rs` (step 2c.7 in §9) runs **both backends
+on every test input** and asserts identical `SwiftFile` IR. This test
+strategy is only possible because both paths are reachable at runtime
+through the flag. Removing the flag would require restructuring the
+entire regression suite.
+
+The flag is therefore a **permanent part of the CLI contract**, not a
+temporary scaffold to be removed after Phase 2c ships.
+
 ---
 
 ## 6. `parse_with_treesitter()` Implementation
