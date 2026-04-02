@@ -9,14 +9,14 @@ license     = "MIT"
 name = "sarah"
 path = "src/main.rs"
 
+[lib]
+name = "sarah_cli_lib"
+path = "src/lib.rs"
+
 [dependencies]
-# Argument parsing
-clap = { version = "4", features = ["derive"] }
-# Serialisation for diagnostic JSON / AST JSON output
+clap        = { version = "4", features = ["derive"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
-# Error handling
-thiserror = "1"
-anyhow    = "1"
-# Colourised terminal output
-colored = "2"
+thiserror   = "1"
+anyhow      = "1"
+colored     = "2"
