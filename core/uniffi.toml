@@ -1,0 +1,6 @@
+[bindings.swift]
+# All generated Swift types are prefixed with "Core" to avoid name collisions.
+ffi_module_name = "CoreFFI"
+
+[bindings.kotlin]
+package_name = "dev.swiftrust.core"

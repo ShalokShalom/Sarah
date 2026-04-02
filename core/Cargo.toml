@@ -1,0 +1,21 @@
+[package]
+name    = "swift-rust-core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust core crate — canonical counter example (Phase 1)"
+license = "MIT"
+
+# UniFFI requires both cdylib (for Swift dynamic linking) and
+# staticlib (for iOS static frameworks / XCFramework).
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+uniFFI    = { version = "0.28", features = ["scaffolding"] }
+thiserror = "1"
+
+[build-dependencies]
+uniFFI = { version = "0.28", features = ["build"] }
+
+[dev-dependencies]
+# doc-tests run via `cargo test` — no extra deps needed.
