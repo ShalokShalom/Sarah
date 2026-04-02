@@ -1,110 +1,130 @@
-# SPEC-001: Core vs Shell Classification
+# SPEC-001 — Core/Shell Classification
 
-| Field | Value |
-|-------|-------|
-| Status | Accepted |
-| Author | Architecture Team |
-| Date | 2026-04-02 |
-| Bounded Context | Transpiler Context |
-| Parent RFC | RFC-001 |
-| Related ADRs | ADR-005 |
+**Status:** Accepted  
+**Version:** 1.1.0  
+**Date:** 2026-04-02  
+**Authors:** Sarah Project  
+**Changelog:** v1.1 — Added Async Tier classification (A1, A1-sync, A2); see SPEC-006 for full async strategy.
 
 ---
 
-## Problem Statement
+## 1. Purpose
 
-The transpiler must decide, for every Swift source file, whether it belongs to the **Core** (business logic, safe to migrate to Rust) or to the **Shell** (platform/UI-coupled, must stay in Swift). This decision drives the entire downstream pipeline: Core files enter the tiered lowering pipeline; Shell files receive UniFFI call-site generation.
-
-An incorrect classification—treating a Shell file as Core—will produce Rust code that references Apple-framework types, which will not compile. The inverse mistake—treating a Core file as Shell—will leave migratable business logic in Swift unnecessarily.
+Define the algorithm by which Sarah classifies Swift source files and declarations as belonging to the **Core** layer (transpilable to Rust) or the **Shell** layer (remains Swift, wraps Core), and the tier assigned to each Core declaration.
 
 ---
 
-## Goals
+## 2. Tier Taxonomy
 
-1. Detect all Apple-platform shell imports (UIKit, SwiftUI, AppKit, WatchKit, StoreKit, ARKit, etc.).
-2. Mark each Swift source file as `Core` or `Shell` with high precision.
-3. For Shell files, identify the public API surface that Core functions call, and flag it for UniFFI stub generation (SPEC-004).
-4. Produce machine-readable classification output (JSON) consumable by downstream pipeline stages.
+| Tier | Description | Key constructs |
+|------|-------------|---------------|
+| **1** | Golden-core safe Rust | `struct`, `enum`, pure `func`, value types |
+| **2** | Shared-ownership | `class` → `Arc<Mutex<T>>` |
+| **3** | Manual / unsupported | Protocols with PATs, existentials, ObjC interop |
+| **A1** | Async value function | `async func` (no class receiver) → callback + Tokio spawn |
+| **A1-sync** | Async wrapper over sync body | `async func` with no internal `await` → `spawn_blocking` |
+| **A2** | Async on class receiver | `async func` on `class` → `ASYNC-LOCK-RISK` diagnostic |
 
----
-
-## Non-Goals
-
-- This SPEC does not define how Core files are lowered (see SPEC-002, SPEC-003).
-- This SPEC does not define the UniFFI binding format (see SPEC-004).
-- This SPEC does not handle Swift Package Manager dependency graphs (future SPEC).
+Async tiers are orthogonal to synchronous tiers: a Tier 1 struct may have Tier A1 methods. The combined tier is written as e.g. `1/A1`.
 
 ---
 
-## Behaviour
+## 3. Classification Algorithm
 
-### Shell Import Trigger List (v1)
+### 3.1 File-level
 
-A file is classified as **Shell** if it contains a top-level `import` of any framework in this list:
+1. Parse the Swift file into an AST.
+2. For each top-level declaration, apply declaration-level classification (§3.2).
+3. If **all** declarations are Tier 1 or A1/A1-sync → file is **Core**.
+4. If **any** declaration is Tier 2 → file is **Core (Tier 2 present)**; emit `T2-` diagnostics.
+5. If **any** declaration is Tier 3 → file is **Shell**; emit `T3-` diagnostics.
+6. If **any** declaration is A2 → emit `ASYNC-LOCK-RISK`; generation continues with mitigated pattern (see SPEC-006 §4).
+
+### 3.2 Declaration-level
 
 ```
-SwiftUI, UIKit, AppKit, WatchKit, TVUIKit,
-StoreKit, ARKit, RealityKit, SceneKit,
-MapKit, CoreLocation (when used with CLLocationManagerDelegate),
-Combine (when used with @Published / ObservableObject),
-XCTest
-```
-
-> **Note:** `Foundation` is NOT a Shell trigger. It is allowed in Core files.  
-> `Combine` used purely for `Future`/`Publisher` in business logic is a yellow flag, not an automatic Shell classification; the classifier emits a warning.
-
-### Classification Algorithm
-
-```
-for each file F in project:
-    imports = parse_top_level_imports(F)
-    if imports ∩ SHELL_TRIGGER_LIST ≠ ∅:
-        classify(F, Shell)
-        record_public_api_surface(F)   // for SPEC-004
+classify(decl):
+  if decl is struct or enum with value-type stored properties:
+    → Tier 1
+  if decl is class:
+    → Tier 2  (emit T2-CLASS)
+  if decl is protocol with associated types:
+    → Tier 3  (emit T3-PAT)
+  if decl is func:
+    if async and receiver is class:
+      → Tier A2  (emit ASYNC-LOCK-RISK)
+    if async and body contains no await:
+      → Tier A1-sync
+    if async:
+      → Tier A1
     else:
-        classify(F, Core)
-        enqueue_for_tiered_lowering(F) // for SPEC-002
+      → Tier 1
+  if decl references ObjC / @objc / NSObject:
+    → Tier 3  (emit T3-OBJC)
 ```
 
-### Output Schema
+---
+
+## 4. JSON Output Schema
 
 ```json
 {
-  "file": "Sources/Auth/LoginViewModel.swift",
-  "classification": "Shell",
-  "shell_triggers": ["SwiftUI", "Combine"],
-  "public_api_surface": [
-    { "name": "submit", "params": ["username: String", "password: String"], "returns": "Void" }
+  "file": "Sources/UserService.swift",
+  "file_tier": "Core",
+  "declarations": [
+    {
+      "name": "UserService",
+      "kind": "struct",
+      "tier": "1",
+      "async_tier": null,
+      "diagnostics": []
+    },
+    {
+      "name": "fetchUser",
+      "kind": "func",
+      "tier": "1",
+      "async_tier": "A1",
+      "combined_tier": "1/A1",
+      "diagnostics": []
+    },
+    {
+      "name": "SessionManager",
+      "kind": "class",
+      "tier": "2",
+      "async_tier": null,
+      "diagnostics": ["T2-CLASS"]
+    },
+    {
+      "name": "refresh",
+      "kind": "func",
+      "tier": "2",
+      "async_tier": "A2",
+      "combined_tier": "2/A2",
+      "diagnostics": ["ASYNC-LOCK-RISK"]
+    }
   ]
 }
 ```
 
-```json
-{
-  "file": "Sources/Auth/LoginStateMachine.swift",
-  "classification": "Core",
-  "shell_triggers": [],
-  "tier_hint": null
-}
-```
+---
+
+## 5. Diagnostic Codes
+
+| Code | Tier | Meaning |
+|------|------|---------|
+| `T1-CLOSURE` | 1 | Closure captures non-value type; review ownership |
+| `T2-CLASS` | 2 | `class` declaration → `Arc<Mutex<T>>` in output |
+| `T2-INHERITANCE` | 2 | Class inheritance present; Tier 2 with struct refactor suggestion |
+| `T3-PAT` | 3 | Protocol with associated types; Shell only |
+| `T3-OBJC` | 3 | ObjC interop; Shell only |
+| `ASYNC-LOCK-RISK` | A2 | Async func on class receiver; lock-before-await pattern applied |
 
 ---
 
-## Acceptance Criteria
+## 6. References
 
-| # | Scenario | Expected Classification |
-|---|----------|------------------------|
-| 1 | File imports `SwiftUI` | Shell |
-| 2 | File imports `Foundation` only | Core |
-| 3 | File imports `UIKit` and `Foundation` | Shell |
-| 4 | File has zero imports | Core |
-| 5 | File imports `Combine` with `ObservableObject` | Shell (with warning) |
-| 6 | File imports `XCTest` | Shell |
-
----
-
-## References
-
-- RFC-001: Progressive Migration Engine
-- SPEC-002: Tiered Lowering
-- SPEC-004: UniFFI Boundary Generation
+- SPEC-002 — Tiered Lowering
+- SPEC-003 — Class Compatibility
+- SPEC-006 — Async Bridging Strategy
+- ADR-005 — Tiered Lowering vs Strict Subset
+- ADR-006 — Three-Zone Async Boundary Model
